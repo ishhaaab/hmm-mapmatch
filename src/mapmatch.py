@@ -3,13 +3,19 @@
 `match_trace` wires the pieces from hmm.py and candidates.py together for a
 whole noisy trace. The two Phase-2 baselines the project must beat (raw
 haversine polyline, nearest-segment snap) live here too, along with the
-route-distance primitive shared by the transition model and the baselines.
+route-distance terms shared by the transition model and the baselines.
+
+Units: coordinates in degrees (lat/lon), distances in metres, times in
+seconds; the road network is the straight-segment model documented in
+graph.py.
 
 Route-distance rule of thumb (the classic bug): the driving distance runs
 from the *projection foot on edge A* to the *projection foot on edge B* —
 partial distance to A's exit node + shortest network path + partial distance
 from B's entry node to the foot. Consecutive fixes on the same edge just use
-|frac diff| x length.
+|frac diff| x length. The three helper-terms below encode this rule once, so
+the standalone `route_distance_between` and the cache-aware
+`_transition_matrix` cannot drift apart.
 """
 from __future__ import annotations
 
@@ -23,7 +29,24 @@ from src.candidates import Candidate, CandidateGrid
 from src.geo import haversine_m
 from src.hmm import emission_logprob, transition_logprob, viterbi
 
-ROUTE_CUTOFF_M = 2_000.0  # driving distances beyond this are treated as impossible
+ROUTE_CUTOFF_M = 2_000.0  # network distances beyond this are treated as impossible
+
+
+def _along_edge_distance(
+    cand_a: Candidate, cand_b: Candidate, edge_lengths: Dict[int, float]
+) -> float:
+    """Driving distance between two feet that lie on the same edge (metres)."""
+    return abs(cand_b.frac - cand_a.frac) * edge_lengths[cand_a.edge_id]
+
+
+def _remaining_to_exit(cand: Candidate, edge_lengths: Dict[int, float]) -> float:
+    """Distance from cand's foot along travel direction to its edge's exit."""
+    return (1.0 - cand.frac) * edge_lengths[cand.edge_id]
+
+
+def _entry_to_foot(cand: Candidate, edge_lengths: Dict[int, float]) -> float:
+    """Distance from cand's edge's entry node to cand's foot."""
+    return cand.frac * edge_lengths[cand.edge_id]
 
 
 def route_distance_between(
@@ -35,24 +58,27 @@ def route_distance_between(
     """Driving distance between two candidate projection points (metres).
 
     Same edge: |frac_b - frac_a| x length (motion along that edge).
-    Different edges: distance to exit node of edge A + shortest path to the
-    entry node of edge B + distance to the foot on edge B. Returns inf when
-    no network path exists.
+    Different edges: remaining distance to edge A's exit node + shortest
+    network path to edge B's entry node + distance to the foot on edge B.
+    Returns inf when no network path exists.
     """
-    len_a = edge_lengths[cand_a.edge_id]
     if cand_a.edge_id == cand_b.edge_id:
-        return abs(cand_b.frac - cand_a.frac) * len_a
+        return _along_edge_distance(cand_a, cand_b, edge_lengths)
 
-    remaining_a = (1.0 - cand_a.frac) * len_a
-    head_b = cand_b.frac * edge_lengths[cand_b.edge_id]
     try:
         net = nx.shortest_path_length(graph, cand_a.v, cand_b.u, weight="length_m")
     except (nx.NetworkXNoPath, nx.NodeNotFound):
         return float("inf")
-    return remaining_a + net + head_b
+
+    return (
+        _remaining_to_exit(cand_a, edge_lengths)
+        + net
+        + _entry_to_foot(cand_b, edge_lengths)
+    )
 
 
 def _emission_matrix(cands: Sequence[Candidate], sigma: float) -> np.ndarray:
+    """Log emission vector over one fix's candidate set."""
     return np.array([emission_logprob(c.dist_m, sigma) for c in cands])
 
 
@@ -63,17 +89,19 @@ def _transition_matrix(
     edge_lengths: Dict[int, float],
     graph: nx.MultiDiGraph,
     beta: float,
-    net_cache: Dict[int, dict],
+    net_cache: Dict[int, Dict[int, float]],
 ) -> np.ndarray:
     """(S_{t-1}, S_t) log transition matrix between two consecutive fixes.
 
     net_cache: node -> {node: driving distance} memo shared across the whole
-    trace; single-source Dijkstra is run once per unique exit node.
+    trace; single-source Dijkstra is run once per unique exit node. Uses the
+    same route-distance terms as `route_distance_between`, but resolves the
+    network segment from the cache instead of one full Dijkstra per pair.
     """
     S_prev, S_curr = len(cands_prev), len(cands_curr)
     trans = np.zeros((S_prev, S_curr))
 
-    net_from = {}
+    net_from: Dict[int, Dict[int, float]] = {}
     for c in cands_prev:
         if c.v in net_from:
             continue
@@ -89,18 +117,18 @@ def _transition_matrix(
     for j, cj in enumerate(cands_prev):
         for k, ck in enumerate(cands_curr):
             if cj.edge_id == ck.edge_id:
-                rd = abs(ck.frac - cj.frac) * edge_lengths[cj.edge_id]
+                rd = _along_edge_distance(cj, ck, edge_lengths)
             else:
                 rd = (
-                    (1.0 - cj.frac) * edge_lengths[cj.edge_id]
+                    _remaining_to_exit(cj, edge_lengths)
                     + net_from[cj.v].get(ck.u, float("inf"))
-                    + ck.frac * edge_lengths[ck.edge_id]
+                    + _entry_to_foot(ck, edge_lengths)
                 )
             trans[j, k] = transition_logprob(rd, euclid_m, beta)
     return trans
 
 
-def score_trace(
+def decode_trace(
     fixes: Mapping[str, np.ndarray],
     grid: CandidateGrid,
     graph: nx.MultiDiGraph,
@@ -128,7 +156,7 @@ def score_trace(
 
     emissions = [_emission_matrix(cands, sigma) for cands in cands_per_fix]
 
-    net_cache: Dict[int, dict] = {}
+    net_cache: Dict[int, Dict[int, float]] = {}
     transitions = [
         _transition_matrix(
             cands_per_fix[t - 1], cands_per_fix[t],
@@ -153,8 +181,12 @@ def match_trace(
     sigma: float,
     beta: float,
 ) -> List[Candidate]:
-    """Decode one noisy trace into the list of matched Candidate objects."""
-    return score_trace(fixes, grid, graph, edge_lengths, sigma, beta)[0]
+    """Decode one noisy trace into the list of matched Candidate objects.
+
+    Convenience over `decode_trace` for callers that do not need the fix
+    index alignment (e.g. `refit_sigma_beta` in em.py does).
+    """
+    return decode_trace(fixes, grid, graph, edge_lengths, sigma, beta)[0]
 
 
 def nearest_snap(

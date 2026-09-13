@@ -84,6 +84,7 @@ class CandidateGrid:
                     self._cells[(ci, cj)].append(idx)
 
     def _cell(self, lat: float, lon: float) -> Tuple[int, int]:
+        """Grid cell indices for a degree coordinate."""
         return (
             math.floor(lat / self.cell_size_deg),
             math.floor(lon / self.cell_size_deg),
