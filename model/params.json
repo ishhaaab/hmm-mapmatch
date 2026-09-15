@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "sigma_m": 15.411433846405458,
+  "beta_m": 6.124707684590859,
+  "observation_interval_s": 5.0,
+  "candidate_radius_m": 120.0,
+  "max_candidates": 40,
+  "training": {
+    "kind": "synthetic_hard_viterbi",
+    "route_seeds": [
+      20,
+      21,
+      22,
+      23,
+      24
+    ],
+    "noise_seeds": [
+      3457937418,
+      620704480,
+      4187828208,
+      1963450972,
+      430756872
+    ],
+    "generating_sigma_m": 15.0,
+    "dropout_p": 0.1,
+    "gaps": 1,
+    "iterations": 3
+  }
+}

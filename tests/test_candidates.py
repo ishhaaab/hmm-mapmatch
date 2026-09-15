@@ -3,6 +3,7 @@
 Uses a tiny hand-built ~111 m square graph (nodes/e the table schemas from
 graph.py) so expected distances and projection fractions are exact.
 """
+
 import pandas as pd
 import pytest
 
@@ -55,6 +56,14 @@ def test_grid_returns_all_edges_within_radius():
         assert c.frac == pytest.approx(0.5, abs=1e-9)
 
 
+def test_grid_caps_candidates_after_deterministic_distance_sort():
+    nodes, edges = _square_graph()
+    candidates = CandidateGrid(nodes, edges, radius_m=100.0, max_candidates=2).query(
+        0.0005, 0.0005
+    )
+    assert [candidate.edge_id for candidate in candidates] == [0, 1]
+
+
 def test_grid_clamps_projection_past_endpoint():
     nodes, edges = _square_graph()
     grid = CandidateGrid(nodes, edges, radius_m=150.0)
@@ -90,3 +99,56 @@ def test_default_radius_scales_with_sigma():
     assert _default_radius(25.0) == 75.0
     assert _default_radius(40.0) == 120.0
     assert _default_radius(10.0) == 50.0  # floor keeps a sane minimum
+
+
+def test_grid_accounts_for_longitude_scale_at_high_latitude():
+    nodes = pd.DataFrame(
+        {
+            "node_id": [0, 1],
+            "lat": [80.0, 80.00001],
+            "lon": [0.002, 0.002],
+        }
+    )
+    edges = pd.DataFrame(
+        {
+            "edge_id": [0],
+            "u": [0],
+            "v": [1],
+            "length_m": [1.2],
+            "bearing": [0.0],
+        }
+    )
+    candidates = CandidateGrid(nodes, edges, radius_m=100.0).query(80.0, 0.0)
+    assert [candidate.edge_id for candidate in candidates] == [0]
+    assert candidates[0].dist_m < 40.0
+
+
+def test_grid_drops_indistinguishable_longer_parallel_edge():
+    nodes, edges = _square_graph()
+    duplicate = edges.iloc[[0]].copy()
+    duplicate["edge_id"] = 10
+    duplicate["length_m"] *= 2.0
+    candidates = CandidateGrid(
+        nodes, pd.concat([edges, duplicate], ignore_index=True), radius_m=40.0
+    ).query(0.0, 0.0005)
+    assert 0 in {candidate.edge_id for candidate in candidates}
+    assert 10 not in {candidate.edge_id for candidate in candidates}
+
+
+def test_grid_uses_lower_id_for_equal_parallel_edges():
+    nodes, edges = _square_graph()
+    duplicate = edges.iloc[[0]].copy()
+    duplicate["edge_id"] = -1
+    candidates = CandidateGrid(
+        nodes,
+        pd.concat([edges, duplicate], ignore_index=True),
+        radius_m=40.0,
+    ).query(0.0, 0.0005)
+    assert -1 in {candidate.edge_id for candidate in candidates}
+    assert 0 not in {candidate.edge_id for candidate in candidates}
+
+
+def test_grid_rejects_nonpositive_radius():
+    nodes, edges = _square_graph()
+    with pytest.raises(ValueError, match="radius_m"):
+        CandidateGrid(nodes, edges, radius_m=0.0)

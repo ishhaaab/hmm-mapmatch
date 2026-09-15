@@ -5,15 +5,16 @@
   independently (worked out on paper from the raw probabilities), plus the
   variable-width-trellis contract used by map matching.
 """
+
 import math
 
 import numpy as np
 import pytest
 
-from src.hmm import emission_logprob, transition_logprob, viterbi
-
+from src.hmm import emission_logprob, posterior_marginals, transition_logprob, viterbi
 
 # ---------------------------------------------------------------- emission --
+
 
 def test_emission_matches_gaussian_formula():
     for sigma in (15.0, 25.0, 40.0):
@@ -32,6 +33,7 @@ def test_emission_rejects_nonpositive_sigma():
 
 
 # -------------------------------------------------------------- transition --
+
 
 def test_transition_matches_paper_formula():
     beta = 0.5
@@ -52,6 +54,7 @@ def test_transition_rejects_nonpositive_beta():
 
 
 # ---------------------------------------------------------------- viterbi ---
+
 
 def _constant_two_state_trellis():
     """T=3, S=2 with transitions that favour state switching.
@@ -89,12 +92,19 @@ def test_viterbi_returns_most_likely_sequence():
     for t in range(1, len(emissions)):
         lp += transitions[t - 1][path[t - 1], path[t]] + emissions[t][path[t]]
     assert lp == pytest.approx(math.log(0.12348), rel=1e-9)
-    assert lp == pytest.approx(max(
-        starts[i] + emissions[0][i]
-        + transitions[0][i, j] + emissions[1][j]
-        + transitions[1][j, k] + emissions[2][k]
-        for i in range(2) for j in range(2) for k in range(2)
-    ))
+    assert lp == pytest.approx(
+        max(
+            starts[i]
+            + emissions[0][i]
+            + transitions[0][i, j]
+            + emissions[1][j]
+            + transitions[1][j, k]
+            + emissions[2][k]
+            for i in range(2)
+            for j in range(2)
+            for k in range(2)
+        )
+    )
 
 
 def test_viterbi_single_timestep():
@@ -121,3 +131,28 @@ def test_viterbi_impossible_transition_is_avoided():
     transitions = [np.array([[-1.0, -np.inf], [-1.0, -1.0]])]
     starts = np.array([0.0, 0.0])
     assert viterbi(emissions, transitions, starts) == [0, 0]
+
+
+def test_viterbi_rejects_entirely_impossible_timestep():
+    emissions = [np.zeros(2), np.zeros(2)]
+    transitions = [np.full((2, 2), -np.inf)]
+    with pytest.raises(ValueError, match="no viable state sequence"):
+        viterbi(emissions, transitions, np.zeros(2))
+
+
+def test_viterbi_validates_start_shape_and_transition_count():
+    with pytest.raises(ValueError, match="starts shape"):
+        viterbi([np.zeros(2)], [], np.zeros(1))
+    with pytest.raises(ValueError, match="transition matrices"):
+        viterbi([np.zeros(1), np.zeros(1)], [], np.zeros(1))
+    with pytest.raises(ValueError, match="non-empty one-dimensional"):
+        viterbi([np.array(0.0)], [], np.zeros(1))
+
+
+def test_forward_backward_posteriors_are_normalized():
+    emissions, transitions, starts = _constant_two_state_trellis()
+    posteriors = posterior_marginals(emissions, transitions, starts)
+    assert len(posteriors) == 3
+    for posterior in posteriors:
+        assert np.sum(posterior) == pytest.approx(1.0)
+        assert np.all((posterior >= 0.0) & (posterior <= 1.0))

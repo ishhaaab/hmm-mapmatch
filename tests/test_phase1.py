@@ -4,10 +4,13 @@ Covers the DONE criteria: graph parquet exists with correct columns, route
 lengths are positive, corrupt() preserves ground truth, and outputs are
 reproducible for the same seed. No Viterbi/EM coverage here (Phase 2+).
 """
+
 from pathlib import Path
 
+import networkx as nx
 import numpy as np
 import pyarrow.parquet as pq
+import pytest
 
 from src.graph import as_routing_graph, load_graph
 from src.synthesize import corrupt, sample_route
@@ -37,6 +40,13 @@ def test_sample_route_positive_length():
         assert len(route["edge_ids"]) == len(route["segments"])
         assert all(isinstance(e, int) for e in route["edge_ids"])
         assert len(route["lat"]) == len(route["lon"]) == len(route["cumdist_m"])
+        assert route["cumdist_m"][-1] == pytest.approx(route["length_m"])
+        assert nx.shortest_path_length(
+            G,
+            route["nodes"][0],
+            route["nodes"][-1],
+            weight="length_m",
+        ) == pytest.approx(route["length_m"])
 
 
 def test_corrupt_preserves_ground_truth():

@@ -7,5 +7,10 @@ cache/
 data/raw/*
 !data/raw/.gitkeep
 *.parquet
+!data/processed/nodes.parquet
+!data/processed/edges.parquet
 *.md
 !README.md
+!BUILD_GUIDE.md
+!PROJECT_DOC.md
+!issues.md

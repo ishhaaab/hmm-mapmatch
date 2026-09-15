@@ -1,16 +1,19 @@
 """Route sampler + GPS noise model.
 
 Sample shortest-path routes on the graph, corrupt them with a documented
-noise model (Gaussian jitter + dropouts + tunnel gaps). The clean route —
-including the exact edge ids traversed — is kept as ground truth, so the
-match-rate metric is unambiguous even on parallel roads. Seed every RNG.
+noise model (Gaussian jitter + dropouts + tunnel gaps). The clean route,
+including the exact edge ids traversed, is kept as stable ground truth even
+when nearby roads are geometrically ambiguous. Seed every RNG.
 
 Units: coordinates in degrees (lat/lon), distances in metres, times in
 seconds, speeds in metres/second.
 """
+
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from collections.abc import Mapping
+from itertools import pairwise
+from typing import Any
 
 import networkx as nx
 import numpy as np
@@ -26,29 +29,48 @@ MAX_ROUTE_M = 5_000.0  # longest accepted route, metres
 MAX_TRIES = 200  # OD-pair attempts per requested route
 
 
-def _edge_length(d: Dict[str, Any]) -> float:
+def _edge_length(d: dict[str, Any]) -> float:
     """Edge length in metres; accepts osmnx ('length') or rebuilt ('length_m')."""
     return float(d.get("length_m", d.get("length", 0.0)))
 
 
-def _nx_weight(u: int, v: int, d: Dict[str, Any]) -> float:
-    """networkx weight callable: networkx calls weight(u, v, data)."""
-    return _edge_length(d)
+def _nx_weight(u: int, v: int, d: Mapping[Any, Any]) -> float:
+    """NetworkX weight callable for simple and multi-edge graphs.
+
+    For a MultiDiGraph, NetworkX passes the full ``key -> attributes`` mapping
+    rather than one edge's attributes. Returning zero for that mapping makes
+    every route an unweighted path, so explicitly select the shortest parallel
+    edge here.
+    """
+    if "length_m" in d or "length" in d:
+        return _edge_length(dict(d))
+    lengths = [
+        _edge_length(dict(attrs)) for attrs in d.values() if isinstance(attrs, Mapping)
+    ]
+    if not lengths:
+        raise ValueError(f"edge {u}->{v} has no usable length attribute")
+    return min(lengths)
 
 
-def _densify(G: nx.MultiDiGraph, nodes: List[int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _densify(
+    G: nx.MultiDiGraph, nodes: list[int]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Interpolate a node path into a dense centreline polyline.
 
     Inputs: graph with node x (lon, degrees) / y (lat, degrees); node-id path.
     Outputs: (lat, lon) arrays in degrees + cumulative distance in metres,
     spaced ~STEP_M apart, including both endpoints.
     """
+    if len(nodes) < 2:
+        raise ValueError("a route must contain at least two nodes")
     lats = np.array([float(G.nodes[n]["y"]) for n in nodes])
     lons = np.array([float(G.nodes[n]["x"]) for n in nodes])
-    lat0 = np.radians(lats)
-    dx_m = (lons[1:] - lons[:-1]) * M_PER_DEG_LAT * np.cos((lat0[1:] + lat0[:-1]) / 2.0)
-    dy_m = (lats[1:] - lats[:-1]) * M_PER_DEG_LAT
-    seg_m = np.sqrt(dx_m**2 + dy_m**2)
+    seg_m = np.array(
+        [min(_edge_length(d) for d in G[u][v].values()) for u, v in pairwise(nodes)],
+        dtype=float,
+    )
+    if np.any(~np.isfinite(seg_m)) or np.any(seg_m <= 0.0):
+        raise ValueError("route edges must have finite, positive lengths")
     cum = np.concatenate([[0.0], np.cumsum(seg_m)])
     total = float(cum[-1])
     n_steps = max(int(total / STEP_M), 1)
@@ -60,20 +82,24 @@ def _densify(G: nx.MultiDiGraph, nodes: List[int]) -> Tuple[np.ndarray, np.ndarr
     )
 
 
-def sample_route(G: nx.MultiDiGraph, n: int = 1, seed: int = 0) -> List[Dict[str, Any]]:
+def sample_route(G: nx.MultiDiGraph, n: int = 1, seed: int = 0) -> list[dict[str, Any]]:
     """Sample n shortest-path routes of 2-5 km each.
 
     Inputs: routable MultiDiGraph (edge weights in metres), n routes,
     seed (int, drives ALL randomness here).
     Output: list of route dicts with keys nodes (list[int]), segments
     (list[(u, v)]), edge_ids (list[int], the exact edge key/edge_id chosen
-    per hop — unambiguous on parallel roads), length_m (float), lat/lon
+    per hop, including the selected parallel edge), length_m (float), lat/lon
     (deg arrays of the dense centreline), cumdist_m (metres array). Raises
     RuntimeError if too few OD pairs fall in the 2-5 km band.
     """
+    if n < 0:
+        raise ValueError(f"n must be >= 0, got {n}")
+    if len(G) < 2:
+        raise ValueError("route graph must contain at least two nodes")
     rng = np.random.default_rng(seed)
     node_ids = list(G.nodes)
-    routes: List[Dict[str, Any]] = []
+    routes: list[dict[str, Any]] = []
     tries = 0
     while len(routes) < n and tries < MAX_TRIES * n:
         tries += 1
@@ -86,18 +112,20 @@ def sample_route(G: nx.MultiDiGraph, n: int = 1, seed: int = 0) -> List[Dict[str
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             continue
         hops = [(int(path[i]), int(path[i + 1])) for i in range(len(path) - 1)]
-        length_m = sum(
-            min(_edge_length(d) for d in G[u][v].values()) for u, v in hops
-        )
+        length_m = sum(min(_edge_length(d) for d in G[u][v].values()) for u, v in hops)
         if not (MIN_ROUTE_M <= length_m <= MAX_ROUTE_M):
             continue
         # Exact edge ids per hop: the min-length parallel edge is the one
         # dijkstra picks (multi-edges between the same node pair), so this
-        # stays consistent with length_m and gives unambiguous ground truth.
+        # stays consistent with length_m and gives an exact ground-truth id.
         edge_ids = []
         for u, v in hops:
             best_key, best_d = min(
-                G[u][v].items(), key=lambda kv: _edge_length(kv[1])
+                G[u][v].items(),
+                key=lambda item: (
+                    _edge_length(item[1]),
+                    int(item[1].get("edge_id", item[0])),
+                ),
             )
             edge_ids.append(int(best_d.get("edge_id", best_key)))
         lat, lon, cum = _densify(G, path)
@@ -121,12 +149,12 @@ def sample_route(G: nx.MultiDiGraph, n: int = 1, seed: int = 0) -> List[Dict[str
 
 
 def corrupt(
-    route: Dict[str, Any],
+    route: dict[str, Any],
     sigma_m: float = 15.0,
     dropout_p: float = 0.1,
     gaps: int = 1,
     seed: int = 0,
-) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """Corrupt a clean route into noisy GPS fixes + untouched ground truth.
 
     Inputs: route (one sample_route dict; centreline degrees, cumdist
@@ -137,13 +165,40 @@ def corrupt(
     surviving fixes only; truth has lat/lon/t for the full 1 Hz clean run.
     truth is never jittered or dropped.
     """
+    if not np.isfinite(sigma_m) or sigma_m < 0.0:
+        raise ValueError(f"sigma_m must be finite and >= 0, got {sigma_m}")
+    if not np.isfinite(dropout_p) or not 0.0 <= dropout_p <= 1.0:
+        raise ValueError(f"dropout_p must be in [0, 1], got {dropout_p}")
+    if gaps < 0:
+        raise ValueError(f"gaps must be >= 0, got {gaps}")
+    try:
+        route_lat = np.asarray(route["lat"], dtype=float)
+        route_lon = np.asarray(route["lon"], dtype=float)
+        route_distance = np.asarray(route["cumdist_m"], dtype=float)
+    except KeyError as exc:
+        raise ValueError(f"route is missing required field {exc.args[0]!r}") from exc
+    if any(values.ndim != 1 for values in (route_lat, route_lon, route_distance)):
+        raise ValueError("route lat/lon/cumdist_m values must be one-dimensional")
+    if not (
+        len(route_lat) == len(route_lon) == len(route_distance) and len(route_lat) >= 2
+    ):
+        raise ValueError("route lat/lon/cumdist_m arrays must have equal length >= 2")
+    if np.any(~np.isfinite(route_lat)) or np.any(~np.isfinite(route_lon)):
+        raise ValueError("route coordinates must be finite")
+    if (
+        np.any(~np.isfinite(route_distance))
+        or route_distance[0] != 0.0
+        or np.any(np.diff(route_distance) <= 0.0)
+    ):
+        raise ValueError("route cumulative distance must start at zero and increase")
+
     rng = np.random.default_rng(seed)
-    duration_s = float(route["cumdist_m"][-1]) / SPEED_MPS
+    duration_s = float(route_distance[-1]) / SPEED_MPS
     t = np.arange(0.0, duration_s, 1.0 / FIX_HZ)
     s = t * SPEED_MPS
     truth = {
-        "lat": np.interp(s, route["cumdist_m"], route["lat"]),
-        "lon": np.interp(s, route["cumdist_m"], route["lon"]),
+        "lat": np.interp(s, route_distance, route_lat),
+        "lon": np.interp(s, route_distance, route_lon),
         "t": t,
     }
 
@@ -157,7 +212,7 @@ def corrupt(
     gap_len = int(GAP_S * FIX_HZ)
     for _ in range(gaps):
         if len(t) > gap_len:
-            start = rng.integers(0, len(t) - gap_len)
+            start = rng.integers(0, len(t) - gap_len + 1)
             keep[start : start + gap_len] = False
     if not np.any(keep):  # degenerate: keep the middle fix
         keep[len(keep) // 2] = True

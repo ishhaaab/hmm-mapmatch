@@ -13,10 +13,12 @@ with the densifier and bearing computations and adequate at this scale. If
 sub-segment precision is ever needed, persist each edge's OSM `geometry`
 shape points instead.
 """
+
 from __future__ import annotations
 
+import math
+import warnings
 from pathlib import Path
-from typing import Tuple
 
 import networkx as nx
 import pandas as pd
@@ -59,9 +61,12 @@ def fetch_graph(place: str = PLACE, network_type: str = "drive") -> nx.MultiDiGr
     network_type (OSMnx filter, default 'drive').
     Output: osmnx MultiDiGraph restricted to its largest strongly-connected
     component so random origin/destination pairs are routable.
-    Falls back to a dist-metre box around HSR Layout if geocoding fails.
+    The default place falls back to a fixed HSR bounding box for known OSM or
+    HTTP response failures. Programming and validation errors are not hidden.
     """
     import osmnx as ox
+    from osmnx._errors import InsufficientResponseError, ResponseStatusCodeError
+    from requests import RequestException
 
     ox.settings.use_cache = True
     ox.settings.log_console = False
@@ -70,7 +75,18 @@ def fetch_graph(place: str = PLACE, network_type: str = "drive") -> nx.MultiDiGr
         G = ox.graph_from_place(
             place, network_type=network_type, simplify=True, retain_all=False
         )
-    except Exception:
+    except (
+        InsufficientResponseError,
+        ResponseStatusCodeError,
+        RequestException,
+    ) as exc:
+        if place != PLACE:
+            raise
+        warnings.warn(
+            f"place lookup failed ({exc!r}); falling back to the HSR bounding box",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         G = ox.graph_from_bbox(
             HSR_BBOX, network_type=network_type, simplify=True, retain_all=False
         )
@@ -84,11 +100,13 @@ def largest_strongly_connected(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
     Input: directed MultiDiGraph. Output: subgraph copy on the largest SCC,
     so every node can reach every other node (routability).
     """
+    if len(G) == 0:
+        raise ValueError("cannot select a connected component from an empty graph")
     largest = max(nx.strongly_connected_components(G), key=len)
     return G.subgraph(largest).copy()
 
 
-def graph_to_tables(G: nx.MultiDiGraph) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def graph_to_tables(G: nx.MultiDiGraph) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Convert an osmnx graph into nodes/edges tables.
 
     Input: MultiDiGraph with per-node x (lon, degrees) / y (lat, degrees)
@@ -107,12 +125,15 @@ def graph_to_tables(G: nx.MultiDiGraph) -> Tuple[pd.DataFrame, pd.DataFrame]:
     for edge_id, (u, v, _key, d) in enumerate(G.edges(keys=True, data=True)):
         du = G.nodes[u]
         dv = G.nodes[v]
+        length_m = float(d.get("length", 0.0))
+        if not math.isfinite(length_m) or length_m <= 0.0:
+            raise ValueError(f"edge {u}->{v} has invalid length {length_m}")
         edge_rows.append(
             {
                 "edge_id": int(edge_id),
                 "u": int(u),
                 "v": int(v),
-                "length_m": float(d.get("length", 0.0)),
+                "length_m": length_m,
                 "bearing": bearing_deg(du["y"], du["x"], dv["y"], dv["x"]),
             }
         )
@@ -125,7 +146,7 @@ def graph_to_tables(G: nx.MultiDiGraph) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return nodes, edges
 
 
-def download_graph(place: str = PLACE) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def download_graph(place: str = PLACE) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Download the graph for `place` and return it as tables.
 
     Input: place (Nominatim query string, degrees-based lookup server-side).
@@ -170,7 +191,7 @@ def save_graph(
 
 def load_graph(
     out_dir: Path = PROCESSED,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Read nodes.parquet + edges.parquet back, validating columns.
 
     Input: out_dir holding the parquet files. Outputs: (nodes, edges).
@@ -193,19 +214,34 @@ def load_graph(
     return nodes, edges
 
 
-def as_routing_graph(
-    nodes: pd.DataFrame, edges: pd.DataFrame
-) -> nx.MultiDiGraph:
+def as_routing_graph(nodes: pd.DataFrame, edges: pd.DataFrame) -> nx.MultiDiGraph:
     """Rebuild a weighted MultiDiGraph from the persisted tables.
 
     Inputs: nodes/edges tables as written by save_graph. Output:
     MultiDiGraph with node x/y (degrees) and edge length_m (metres)
     weights, suitable for shortest-path sampling. No network access.
     """
+    required_node_columns = {"node_id", "lat", "lon"}
+    required_edge_columns = {"edge_id", "u", "v", "length_m"}
+    if not required_node_columns.issubset(nodes.columns):
+        missing = sorted(required_node_columns - set(nodes.columns))
+        raise ValueError(f"nodes table is missing {missing}")
+    if not required_edge_columns.issubset(edges.columns):
+        missing = sorted(required_edge_columns - set(edges.columns))
+        raise ValueError(f"edges table is missing {missing}")
+    if nodes["node_id"].duplicated().any():
+        raise ValueError("nodes table contains duplicate node_id values")
+    if edges["edge_id"].duplicated().any():
+        raise ValueError("edges table contains duplicate edge_id values")
+
     G: nx.MultiDiGraph = nx.MultiDiGraph()
     for row in nodes.itertuples(index=False):
         G.add_node(int(row.node_id), x=float(row.lon), y=float(row.lat))
     for row in edges.itertuples(index=False):
+        if int(row.u) not in G or int(row.v) not in G:
+            raise ValueError(f"edge {row.edge_id} references a missing node")
+        if not math.isfinite(float(row.length_m)) or float(row.length_m) <= 0.0:
+            raise ValueError(f"edge {row.edge_id} has an invalid length")
         G.add_edge(
             int(row.u),
             int(row.v),
