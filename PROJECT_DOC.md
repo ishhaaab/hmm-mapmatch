@@ -67,7 +67,8 @@ not externally calibrated.
 
 This is not textbook soft EM because it does not take expectations under the
 full posterior. `python -m src.em` writes `model/params.json` using route seeds
-20-24. Evaluation uses route seeds 7-11 to avoid direct train/evaluation reuse.
+20-24. Evaluation uses 100 unique seeds (7-19 and 25-111) to avoid direct
+train/evaluation reuse.
 
 ## Evaluation
 
@@ -81,8 +82,9 @@ prediction model.
 
 The noise grid keeps deployment parameters fixed while changing generating
 noise and dropout. This avoids oracle knowledge of the test noise. Each cell
-currently has only five synthetic routes, so results need confidence intervals,
-more seeds, another region, and real audited traces before any production claim.
+contains the same 100 synthetic routes and reports deterministic 95% route-level
+percentile bootstrap intervals from 10,000 resamples. Another region and real
+audited traces are still required before any production claim.
 
 ## Serving Contract
 
@@ -108,5 +110,5 @@ healthy.
 2. Evaluate on map-aligned real traces and a second geographic region.
 3. Calibrate confidence and define abstention thresholds.
 4. Add heading/speed-aware transitions instead of relying only on thinning.
-5. Add benchmark uncertainty, latency percentiles, and concurrency/load tests.
+5. Add latency percentiles and concurrency/load tests.
 6. Add monitoring and scheduled recalibration only after real labels exist.

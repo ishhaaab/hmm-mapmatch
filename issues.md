@@ -21,6 +21,8 @@
   health metadata are implemented.
 - Processed graph data, project documentation, and metrics were omitted from a
   clean clone by broad ignore rules. They are now included explicitly.
+- The six-cell noise benchmark now uses 100 unique routes instead of five and
+  reports paired, route-level percentile bootstrap confidence intervals.
 
 ## Open Limitations
 
@@ -34,11 +36,10 @@ on complex junctions.
 
 ### High-noise false positives
 
-At 40 m generating noise, edge recall remains about 0.86-0.88 but precision is
-much lower, producing F1 around 0.60-0.62. The reconstructed route is about
-1.67-1.72 times the true distance. A heading/speed model and real calibration
-data are more defensible next steps than tuning against the five evaluation
-seeds.
+At 40 m generating noise, edge recall remains about 0.89-0.90 but precision is
+about 0.49, producing F1 around 0.63. The reconstructed route is about
+1.67-1.70 times the true distance. A heading/speed model and real calibration
+data are more defensible next steps than tuning against the synthetic benchmark.
 
 ### Synthetic-only calibration
 
@@ -46,12 +47,12 @@ The checked-in sigma and beta are fitted on five synthetic routes. They are
 useful reproducible defaults, not proof of transfer to phone GPS. Confidence is
 also conditional on the candidate set and has no empirical calibration curve.
 
-### Small benchmark
+### Synthetic benchmark scope
 
-Each noise-grid cell has five routes. A second corruption seed preserves the
-same broad degradation pattern, but this sample is too small for strong claims.
-The next evaluation should use more seeds, confidence intervals, a second
-region, and real labels.
+Each noise-grid cell has 100 routes with 95% bootstrap intervals. This reduces
+sampling uncertainty but does not address transfer beyond one synthetic road
+graph and noise model. The next evaluation needs a second region and real
+labels.
 
 ### Simplified temporal model
 

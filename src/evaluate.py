@@ -43,9 +43,31 @@ from src.synthesize import SPEED_MPS, corrupt, sample_route
 
 DEFAULT_SIGMAS = (15, 25, 40)
 DEFAULT_DROPOUTS = (0.0, 0.1)
-DEFAULT_ROUTE_SEEDS = (7, 8, 9, 10, 11)
+# Keep evaluation routes disjoint from the calibration seeds 20-24.
+DEFAULT_ROUTE_SEEDS = tuple(range(7, 20)) + tuple(range(25, 112))
+DEFAULT_N_ROUTES = len(DEFAULT_ROUTE_SEEDS)
 DEFAULT_CORRUPT_SEED = 3
 DEFAULT_GAPS = 1
+DEFAULT_BOOTSTRAP_CONFIDENCE = 0.95
+DEFAULT_BOOTSTRAP_RESAMPLES = 10_000
+DEFAULT_BOOTSTRAP_SEED = 17
+
+CELL_AGGREGATES = {
+    "mean_match_rate": "match_rate",
+    "mean_edge_precision": "edge_precision",
+    "mean_edge_f1": "edge_f1",
+    "mean_lcs_rate": "lcs_rate",
+    "mean_hmm_err_m": "hmm_err_m",
+    "mean_snap_err_m": "snap_err_m",
+    "mean_raw_err_m": "raw_err_m",
+    "mean_eta_hmm_s": "eta_hmm_err_s",
+    "mean_eta_raw_s": "eta_raw_err_s",
+    "mean_eta_delta_s": "eta_mae_delta_s",
+    "frac_hmm_beats_snap": "hmm_beats_snap",
+    "frac_hmm_beats_raw": "hmm_beats_raw",
+    "mean_feet_ratio": "feet_ratio",
+    "mean_walk_ratio": "walk_ratio",
+}
 
 
 def _calibrated_parameter(name: str, fallback: float) -> float:
@@ -65,6 +87,51 @@ DEFAULT_MAX_CANDIDATES = int(_calibrated_parameter("max_candidates", 40.0))
 def _mean(rows: Sequence[dict], key: str) -> float:
     """Arithmetic mean of one numeric field in a non-empty row collection."""
     return float(sum(row[key] for row in rows) / len(rows))
+
+
+def bootstrap_mean_intervals(
+    rows: Sequence[dict],
+    metrics: dict[str, str],
+    confidence_level: float = DEFAULT_BOOTSTRAP_CONFIDENCE,
+    n_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    seed: int = DEFAULT_BOOTSTRAP_SEED,
+) -> dict[str, dict[str, float]]:
+    """Percentile bootstrap intervals for route-level arithmetic means.
+
+    ``metrics`` maps output aggregate names to numeric fields in each route row.
+    All metrics use the same resampled route indices so uncertainty remains
+    paired within a cell. Calling this with the same seed for every noise cell
+    also preserves the benchmark's paired-route design across cells.
+    """
+    if not rows:
+        raise ValueError("rows must not be empty")
+    if not math.isfinite(confidence_level) or not 0.0 < confidence_level < 1.0:
+        raise ValueError("confidence_level must be finite and in (0, 1)")
+    if (
+        isinstance(n_resamples, bool)
+        or not isinstance(n_resamples, int)
+        or n_resamples <= 0
+    ):
+        raise ValueError("n_resamples must be a positive integer")
+    if not metrics:
+        raise ValueError("metrics must not be empty")
+
+    names = list(metrics)
+    values = np.asarray(
+        [[row[metrics[name]] for name in names] for row in rows], dtype=float
+    )
+    if np.any(~np.isfinite(values)):
+        raise ValueError("bootstrap metrics must be finite")
+
+    rng = np.random.default_rng(seed)
+    indices = rng.integers(0, len(rows), size=(n_resamples, len(rows)))
+    means = values[indices].mean(axis=1)
+    tail = (1.0 - confidence_level) / 2.0
+    bounds = np.quantile(means, (tail, 1.0 - tail), axis=0)
+    return {
+        name: {"lower": float(bounds[0, i]), "upper": float(bounds[1, i])}
+        for i, name in enumerate(names)
+    }
 
 
 def _edge_ids(seq: Sequence[Any]) -> list[int]:
@@ -292,7 +359,7 @@ def run_noise_grid(
     sigmas=DEFAULT_SIGMAS,
     dropouts=DEFAULT_DROPOUTS,
     out: Path = Path("results/metrics.json"),
-    n_routes: int = 5,
+    n_routes: int = DEFAULT_N_ROUTES,
     route_seeds=DEFAULT_ROUTE_SEEDS,
     corrupt_seed: int = DEFAULT_CORRUPT_SEED,
     gaps: int = DEFAULT_GAPS,
@@ -302,13 +369,18 @@ def run_noise_grid(
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
     speed_mps: float = SPEED_MPS,
     observation_interval_s: float = DEFAULT_OBSERVATION_INTERVAL_S,
+    bootstrap_confidence: float = DEFAULT_BOOTSTRAP_CONFIDENCE,
+    bootstrap_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    bootstrap_seed: int = DEFAULT_BOOTSTRAP_SEED,
 ) -> dict:
     """Run sigma x dropout grid, persist JSON.
 
     Each cell changes the generating noise and dropout while decoding with one
     fixed, calibrated ``model_sigma`` and beta. This mirrors deployment and
-    avoids leaking the simulated noise label into inference. All RNG is seeded;
-    pass another ``corrupt_seed`` for a second-seed robustness check.
+    avoids leaking the simulated noise label into inference. Route-level
+    percentile bootstrap intervals quantify uncertainty in every aggregate.
+    All RNG is seeded; pass another ``corrupt_seed`` for a second-seed
+    robustness check.
     """
     sigmas = tuple(float(s) for s in sigmas)
     dropouts = tuple(float(d) for d in dropouts)
@@ -332,28 +404,50 @@ def run_noise_grid(
         raise ValueError(
             f"max_candidates must be a positive integer, got {max_candidates}"
         )
-    if n_routes <= 0:
-        raise ValueError(f"n_routes must be > 0, got {n_routes}")
-    seeds = list(route_seeds)[:n_routes]
+    if isinstance(n_routes, bool) or not isinstance(n_routes, int) or n_routes <= 0:
+        raise ValueError(f"n_routes must be a positive integer, got {n_routes}")
+    if not math.isfinite(bootstrap_confidence) or not 0.0 < bootstrap_confidence < 1.0:
+        raise ValueError("bootstrap_confidence must be finite and in (0, 1)")
+    if (
+        isinstance(bootstrap_resamples, bool)
+        or not isinstance(bootstrap_resamples, int)
+        or bootstrap_resamples <= 0
+    ):
+        raise ValueError("bootstrap_resamples must be a positive integer")
+    if (
+        isinstance(bootstrap_seed, bool)
+        or not isinstance(bootstrap_seed, (int, np.integer))
+        or bootstrap_seed < 0
+    ):
+        raise ValueError("bootstrap_seed must be a non-negative integer")
+    bootstrap_seed = int(bootstrap_seed)
+
+    seeds = [int(seed) for seed in list(route_seeds)[:n_routes]]
     if len(seeds) != n_routes:
         raise ValueError("route_seeds must contain at least n_routes values")
+    if len(set(seeds)) != n_routes:
+        raise ValueError("route_seeds must be unique")
     nodes, edges = load_graph()
     graph = as_routing_graph(nodes, edges)
     edge_lengths: dict[int, float] = dict(zip(edges["edge_id"], edges["length_m"]))
     grid = CandidateGrid(nodes, edges, candidate_radius_m, max_candidates)
+
+    routes = [sample_route(graph, n=1, seed=int(seed))[0] for seed in seeds]
+    noise_seeds = [
+        int(
+            np.random.SeedSequence(
+                [int(corrupt_seed), int(route_seed), route_index]
+            ).generate_state(1)[0]
+        )
+        for route_index, route_seed in enumerate(seeds)
+    ]
 
     route_rows: list[dict] = []
     cells: list[dict] = []
     for sigma in sigmas:
         for dropout in dropouts:
             per: list[dict] = []
-            for route_index, rs in enumerate(seeds):
-                route = sample_route(graph, n=1, seed=int(rs))[0]
-                noise_seed = int(
-                    np.random.SeedSequence(
-                        [int(corrupt_seed), int(rs), route_index]
-                    ).generate_state(1)[0]
-                )
+            for rs, route, noise_seed in zip(seeds, routes, noise_seeds, strict=True):
                 fixes, _truth = corrupt(
                     route,
                     sigma_m=sigma,
@@ -391,27 +485,23 @@ def run_noise_grid(
                 )
                 per.append(m)
                 route_rows.append(m)
-            n = len(per)
+            summary = {
+                aggregate: _mean(per, route_metric)
+                for aggregate, route_metric in CELL_AGGREGATES.items()
+            }
             cells.append(
                 {
                     "sigma_m": sigma,
                     "dropout_p": dropout,
-                    "n_routes": n,
-                    "mean_match_rate": _mean(per, "match_rate"),
-                    "mean_edge_precision": _mean(per, "edge_precision"),
-                    "mean_edge_f1": _mean(per, "edge_f1"),
-                    "mean_lcs_rate": _mean(per, "lcs_rate"),
-                    "mean_hmm_err_m": _mean(per, "hmm_err_m"),
-                    "mean_snap_err_m": _mean(per, "snap_err_m"),
-                    "mean_raw_err_m": _mean(per, "raw_err_m"),
-                    "mean_eta_hmm_s": _mean(per, "eta_hmm_err_s"),
-                    "mean_eta_raw_s": _mean(per, "eta_raw_err_s"),
-                    "mean_eta_delta_s": _mean(per, "eta_mae_delta_s"),
-                    "frac_hmm_beats_snap": sum(1 for r in per if r["hmm_beats_snap"])
-                    / n,
-                    "frac_hmm_beats_raw": sum(1 for r in per if r["hmm_beats_raw"]) / n,
-                    "mean_feet_ratio": _mean(per, "feet_ratio"),
-                    "mean_walk_ratio": _mean(per, "walk_ratio"),
+                    "n_routes": len(per),
+                    **summary,
+                    "confidence_intervals": bootstrap_mean_intervals(
+                        per,
+                        CELL_AGGREGATES,
+                        confidence_level=bootstrap_confidence,
+                        n_resamples=bootstrap_resamples,
+                        seed=bootstrap_seed,
+                    ),
                 }
             )
     results = {
@@ -429,6 +519,14 @@ def run_noise_grid(
             "observation_interval_s": float(observation_interval_s),
             "n_nodes": len(nodes),
             "n_edges": len(edges),
+            "bootstrap": {
+                "method": "percentile_bootstrap",
+                "sampling_unit": "route",
+                "confidence_level": float(bootstrap_confidence),
+                "n_resamples": int(bootstrap_resamples),
+                "seed": int(bootstrap_seed),
+                "paired_across_cells": True,
+            },
         },
         "cells": cells,
         "routes": route_rows,

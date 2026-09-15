@@ -26,6 +26,8 @@
 - Report edge recall, precision, F1, LCS recall, distance error, and
   time-equivalent distance error.
 - Run a fixed-parameter sigma/dropout grid with route-specific corruption RNGs.
+- Evaluate 100 unique route seeds per cell with paired, route-level percentile
+  bootstrap confidence intervals.
 - Verify behavior with a second corruption seed.
 
 ### Phase 4: Serving Foundation
@@ -38,14 +40,12 @@
 
 ## Next Checks
 
-1. Run at least 100 route seeds per evaluation cell and report bootstrap
-   intervals.
-2. Add real labeled traces and a geographically separate holdout.
-3. Benchmark p50/p90/p99 latency and concurrent throughput.
-4. Calibrate confidence and add a low-confidence abstention response.
-5. Persist full OSM geometry, then re-run all metrics because candidate identity
+1. Add real labeled traces and a geographically separate holdout.
+2. Benchmark p50/p90/p99 latency and concurrent throughput.
+3. Calibrate confidence and add a low-confidence abstention response.
+4. Persist full OSM geometry, then re-run all metrics because candidate identity
    and projection distances will change.
-6. Define monitoring and retraining only after a real feedback/label source is
+5. Define monitoring and retraining only after a real feedback/label source is
    available.
 
 ## Commands

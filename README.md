@@ -40,23 +40,26 @@ the quadratic trellis cost.
 
 ## Results
 
-`results/metrics.json` contains five deterministic routes per cell, each with a
-60 s gap. The deployed model stays fixed at sigma 15.41 m, beta 6.12 m, a 120 m
-candidate radius, 40 candidates per fix, and a 5 s observation interval; the
-generating noise label is not passed to the decoder.
+`results/metrics.json` contains 100 deterministic routes per cell, each with a
+60 s gap, plus paired 95% route-level percentile bootstrap intervals from
+10,000 resamples. The deployed model stays fixed at sigma 15.41 m, beta 6.12 m,
+a 120 m candidate radius, 40 candidates per fix, and a 5 s observation interval;
+the generating noise label is not passed to the decoder.
 
-| Noise | Dropout | Edge recall | Edge F1 | HMM error | Raw error | Route length / true |
+| Noise | Dropout | Edge recall (95% CI) | Edge F1 (95% CI) | HMM error (95% CI) | Raw error (95% CI) | Route length / true |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 15 m | 0% | 0.979 | 0.925 | 173 m | 326 m | 1.05x |
-| 15 m | 10% | 0.984 | 0.921 | 148 m | 262 m | 1.04x |
-| 25 m | 0% | 0.931 | 0.764 | 952 m | 1,330 m | 1.25x |
-| 25 m | 10% | 0.904 | 0.757 | 757 m | 1,181 m | 1.21x |
-| 40 m | 0% | 0.877 | 0.623 | 2,675 m | 3,214 m | 1.71x |
-| 40 m | 10% | 0.862 | 0.604 | 2,457 m | 2,927 m | 1.67x |
+| 15 m | 0% | 0.977 [0.971, 0.982] | 0.923 [0.915, 0.931] | 141 m [123, 160] | 320 m [283, 358] | 1.04x |
+| 15 m | 10% | 0.975 [0.968, 0.981] | 0.922 [0.913, 0.931] | 137 m [121, 155] | 293 m [261, 327] | 1.04x |
+| 25 m | 0% | 0.953 [0.944, 0.962] | 0.798 [0.786, 0.809] | 806 m [743, 873] | 1,247 m [1,155, 1,343] | 1.22x |
+| 25 m | 10% | 0.947 [0.937, 0.957] | 0.792 [0.779, 0.805] | 777 m [712, 842] | 1,169 m [1,087, 1,254] | 1.22x |
+| 40 m | 0% | 0.897 [0.882, 0.912] | 0.634 [0.618, 0.649] | 2,564 m [2,380, 2,758] | 3,025 m [2,823, 3,230] | 1.70x |
+| 40 m | 10% | 0.893 [0.878, 0.907] | 0.634 [0.618, 0.649] | 2,424 m [2,255, 2,601] | 2,863 m [2,682, 3,045] | 1.67x |
 
-The HMM beats raw haversine on mean distance error in every cell, but not on
-every individual route. Recall alone is optimistic at high noise, so F1 is the
-headline route metric. These are synthetic results over a small sample, not a
+Recall alone is optimistic at high noise, so F1 is the headline route metric.
+Mean HMM distance error is below raw haversine in every cell, although the HMM
+beats raw on only 75-94% of individual routes depending on the cell.
+The intervals quantify route-sampling uncertainty within this synthetic setup;
+they do not establish transfer to real traces or another region and are not a
 production accuracy claim.
 
 ## Run
